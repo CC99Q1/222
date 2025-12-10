@@ -1,0 +1,212 @@
+Import os
+import re
+import random
+import asyncio
+import copy 
+from pathlib import Path
+from typing import Optional, Union
+
+import yt_dlp
+from py_yt import VideosSearch
+from pyrogram import enums, types
+
+from anony.helpers import Track, utils
+
+
+class YouTube:
+    def __init__(self):
+        self.base = "https://www.youtube.com/watch?v="
+        self.cookies = []
+        self.checked = False
+        self.regex = r"(https?://)?(www\.|m\.)?(youtube\.com/(watch\?v=|shorts/)|youtu\.be/)([a-zA-Z0-9_-]{11})" 
+
+        self.search_cache = {} 
+        self.cache_lock = asyncio.Lock()
+
+
+    def get_cookies(self):
+        if not self.checked:
+            if os.path.exists("anony/cookies"):
+                for file in os.listdir("anony/cookies"):
+                    if file.endswith(".txt"):
+                        self.cookies.append(f"anony/cookies/{file}") 
+            self.checked = True
+        if not self.cookies:
+            return None
+        return random.choice(self.cookies)
+
+    def valid(self, url: str) -> bool:
+        return bool(re.match(self.regex, url))
+
+    def url(self, message_1: types.Message) -> Union[str, None]:
+        messages = [message_1]
+        if message_1.reply_to_message:
+            messages.append(message_1.reply_to_message)
+
+        for message in messages:
+            text = message.text or message.caption or ""
+
+            if message.entities:
+                for entity in message.entities:
+                    if entity.type == enums.MessageEntityType.URL:
+                        return text[entity.offset : entity.offset + entity.length]
+
+            if message.caption_entities:
+                for entity in message.caption_entities:
+                    if entity.type == enums.MessageEntityType.TEXT_LINK:
+                        return entity.url
+
+        return None
+
+
+    async def search(self, query: str, m_id: int, video: bool = False) -> Track | None:
+        
+        cache_key = f"{query}_{video}"
+        async with self.cache_lock:
+            if cache_key in self.search_cache:
+                cached_track = self.search_cache[cache_key]
+                
+
+                track_copy = copy.copy(cached_track) 
+                
+                track_copy.message_id = m_id 
+                return track_copy
+
+        
+        def _search_sync():
+            """Runs the blocking/crashing search in a new, separate event loop."""
+            try:
+                _search = VideosSearch(query, limit=1)
+                
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                results = loop.run_until_complete(_search.next())
+                loop.close()
+                return results
+
+            except Exception as e:
+                print(f"[py_yt search error]: {e}")
+                return None
+        
+        results = await asyncio.to_thread(_search_sync)
+
+        if results and results["result"]:
+            data = results["result"][0]
+            
+            track_data = self._parse_track_info_py_yt(data, m_id, video)
+            
+            if track_data:
+                async with self.cache_lock:
+                    
+                    
+                    self.search_cache[cache_key] = copy.copy(track_data)
+            
+            return track_data
+        
+        return None
+
+    def _parse_track_info_py_yt(self, data: dict, m_id: int, video: bool) -> Track | None:
+        """Helper function to parse py_yt info into a Track object, ensuring safety against NoneType errors."""
+        try:
+            channel_name = str(data.get("channel", {}).get("name", "Unknown Channel"))
+            title = str(data.get("title", "Unknown Title"))
+            thumbnail_url = str(data.get("thumbnails", [{}])[-1].get("url", ""))
+
+            return Track(
+                id=data.get("id"),
+                channel_name=channel_name,
+                duration=data.get("duration"),
+                duration_sec=utils.to_seconds(data.get("duration")),
+                message_id=m_id,
+                title=title[:35],
+                thumbnail=thumbnail_url.split("?")[0],
+                url=str(data.get("link")) if data.get("link") else f"{self.base}{data.get('id')}",
+                view_count=data.get("viewCount", {}).get("short"),
+                video=video,
+            )
+        except Exception as e:
+            print(f"[yt.py _parse_track_info_py_yt parsing error]: {e}") 
+            return None
+
+
+    async def download(self, video_id: str, video: bool = False) -> Optional[str]:
+        url = self.base + video_id
+        ext = "mp4" if video else "m4a"
+        filename = f"downloads/{video_id}.{ext}"
+
+        if Path(filename).exists():
+            return filename
+
+        base_opts = {
+            "outtmpl": "downloads/%(id)s.%(ext)s",
+            "quiet": True,
+            "noplaylist": True,
+            "geo_bypass": True,
+            "no_warnings": True,
+            "overwrites": False,
+            "ignoreerrors": True,
+            "nocheckcertificate": True,
+            "cookiefile": self.get_cookies(), 
+        }
+
+        if video:
+            ydl_opts = {
+                **base_opts,
+                "format": "bv[height<=720][ext=mp4]+ba[ext=m4a]/bv[height<=480][ext=mp4]+ba[ext=m4a]/bv[height<=720]+ba/bv[height<=480]+ba/b[ext=mp4][height<=720]/b[ext=mp4][height<=480]/b",
+                "merge_output_format": "mp4",
+            }
+        else:
+            ydl_opts = {
+                **base_opts,
+                "format": "worst",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "m4a",
+                }],
+            }
+
+        def _download():
+            os.makedirs("downloads", exist_ok=True) 
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            return filename
+
+        return await asyncio.to_thread(_download)
+
+    async def download_mp3(self, video_id: str) -> Optional[str]:
+        """Downloads a YouTube video as an MP3 file."""
+        url = self.base + video_id
+        filename = f"downloads/{video_id}.mp3"
+
+        if Path(filename).exists():
+            return filename 
+
+        base_opts = {
+            "outtmpl": "downloads/%(id)s.%(ext)s",
+            "quiet": True,
+            "noplaylist": True,
+            "geo_bypass": True,
+            "no_warnings": True,
+            "overwrites": False,
+            "ignoreerrors": True,
+            "nocheckcertificate": True,
+            "cookiefile": self.get_cookies(),
+        }
+
+        ydl_opts = {
+            **base_opts,
+            "format": "worstaudio/worst", 
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "64", 
+            }],
+        }
+
+        def _download():
+            os.makedirs("downloads", exist_ok=True)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            return filename
+
+        return await asyncio.to_thread(_download)
